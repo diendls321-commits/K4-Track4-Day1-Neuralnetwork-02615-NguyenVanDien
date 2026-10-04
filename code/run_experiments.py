@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -110,7 +111,8 @@ def main():
     loss_c = F.cross_entropy(tiny_m(x_tiny), y_tiny)
     loss_c.backward()
     for name, param in tiny_m.named_parameters():
-        assert param.grad is not None and torch.norm(param.grad).item() >= 0.0
+        grad_norm = torch.norm(param.grad).item() if param.grad is not None else 0.0
+        assert param.grad is not None and grad_norm > 0.0, f"Gradient không hợp lệ tại {name}: {grad_norm}"
     print("[OK] Toàn bộ tham số có gradient hợp lệ sau backward.")
 
     # 5. Part 2: Baseline (3 seeds)
@@ -273,20 +275,37 @@ def main():
     print(f"Mô hình đạt Val Macro-F1 cao nhất: {best_val_cfg['exp_id']} ({best_val_cfg['description']})")
     print(f"  Val Macro-F1 = {best_val_run['summary']['val_macro_f1']:.4f}")
 
-    # Chạy cấu hình cuối cùng (Final Best Model) kết hợp CosineAnnealingLR
+    # Huấn luyện lại đúng cấu hình được chọn bằng validation; không thêm yếu tố mới.
     final_cfg = {
         **best_val_cfg,
         "exp_id": "final-best",
         "group": "final",
-        "scheduler": "cosine",
-        "description": f"Cấu hình tối ưu cuối cùng (Dựa trên {best_val_cfg['exp_id']} + Cosine LR Scheduler)",
+        "description": f"Cấu hình cuối cùng được chọn bằng validation (từ {best_val_cfg['exp_id']})",
     }
     print(f"\n>>> Huấn luyện Final Best Model ({final_cfg['exp_id']})...")
     res_final = run_experiment(final_cfg, data)
     save_result(res_final, str(res_dir))
     plot_run(res_final, str(fig_dir / f"{final_cfg['exp_id']}.png"))
 
-    # Đánh giá trên tập eval
+    # Đánh giá baseline và cấu hình cuối trên eval đúng một lần mỗi cấu hình.
+    # Baseline dự đoán tạm thời không nằm trong thư mục submission.
+    baseline_cfg = baseline_results[0]["cfg"]
+    with tempfile.TemporaryDirectory(prefix="covtype-baseline-") as temp_dir:
+        baseline_pred = Path(temp_dir) / "baseline_predictions.csv"
+        baseline_json = Path(temp_dir) / "baseline_eval.json"
+        baseline_scores = final_eval(baseline_cfg, baseline_results[0], data, str(baseline_pred))
+        baseline_eval_cmd = [
+            sys.executable, str(repo_root / "scripts" / "evaluate.py"),
+            "--pred", str(baseline_pred),
+            "--data", str(repo_root / "data" / "covtype.csv.gz"),
+            "--meta", str(repo_root / "data" / "split_metadata.csv"),
+            "--out", str(baseline_json)
+        ]
+        subprocess.run(baseline_eval_cmd, check=True)
+        with open(baseline_json, "r", encoding="utf-8") as fp:
+            baseline_scores = json.load(fp)
+
+    # predictions_eval.csv chỉ chứa cấu hình cuối cùng.
     pred_path = out_dir / "predictions_eval.csv"
     eval_json_path = out_dir / "eval_result.json"
     print("\n>>> Dự đoán trên tập eval và lưu predictions_eval.csv...")
@@ -318,6 +337,8 @@ def main():
     for r in all_runs:
         eid = r["cfg"]["exp_id"]
         ev_s = None
+        if eid == "base-s1":
+            ev_s = baseline_scores
         if eid == "final-best":
             ev_s = eval_result
         rows.append(to_row(r, eval_scores=ev_s))

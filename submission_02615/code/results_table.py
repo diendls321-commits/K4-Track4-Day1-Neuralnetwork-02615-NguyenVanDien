@@ -13,6 +13,7 @@ Tên cột của sheet "Experiments" (giữ nguyên, đúng thứ tự mẫu):
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 import openpyxl
 
@@ -140,6 +141,59 @@ def write_xlsx(rows: list[dict], template_path: str, out_path: str) -> None:
             if key in col_map:
                 c_idx = col_map[key]
                 ws.cell(row=r_idx, column=c_idx, value=val)
+
+    # Hoàn thiện sheet Seeds từ các baseline thực tế, giữ nguyên bố cục mẫu.
+    seeds_ws = wb["Seeds"]
+    baseline_rows = sorted(
+        (r for r in rows if r.get("group") == "baseline"),
+        key=lambda r: str(r.get("exp_id", "")),
+    )
+    for r_idx in range(2, 7):
+        for c_idx in range(1, 5):
+            seeds_ws.cell(row=r_idx, column=c_idx).value = None
+    seed_values = {"val_acc": [], "val_macro_f1": [], "best_val_loss": []}
+    for r_idx, row in enumerate(baseline_rows[:5], start=2):
+        seeds_ws.cell(row=r_idx, column=1, value=row.get("exp_id"))
+        for c_idx, key in enumerate(("val_acc", "val_macro_f1", "best_val_loss"), start=2):
+            value = row.get(key)
+            seeds_ws.cell(row=r_idx, column=c_idx, value=value)
+            if value is not None:
+                seed_values[key].append(float(value))
+    for c_idx, key in enumerate(("val_acc", "val_macro_f1", "best_val_loss"), start=2):
+        values = seed_values[key]
+        if values:
+            seeds_ws.cell(row=8, column=c_idx, value=statistics.mean(values))
+        if len(values) >= 2:
+            seeds_ws.cell(row=9, column=c_idx, value=statistics.stdev(values))
+            seeds_ws.cell(row=10, column=c_idx, value=2 * statistics.stdev(values))
+
+    # Điền bảng tổng quan theo group để 4 sheet đều phản ánh cùng một bộ kết quả.
+    summary_ws = wb["Summary"]
+    groups = [summary_ws.cell(row=r, column=1).value for r in range(2, 12)]
+    for r_idx, group in enumerate(groups, start=2):
+        group_rows = [r for r in rows if r.get("group") == group]
+        scored = [r for r in group_rows if r.get("val_macro_f1") is not None]
+        accs = [float(r["val_acc"]) for r in scored if r.get("val_acc") is not None]
+        f1s = [float(r["val_macro_f1"]) for r in scored]
+        summary_ws.cell(row=r_idx, column=2, value=len(group_rows))
+        summary_ws.cell(row=r_idx, column=3, value=len(scored))
+        summary_ws.cell(row=r_idx, column=4, value=max(f1s) if f1s else None)
+        summary_ws.cell(row=r_idx, column=5, value=min(f1s) if f1s else None)
+        summary_ws.cell(row=r_idx, column=6, value=max(accs) if accs else None)
+        if group in {"loss", "optimizer", "hparam", "dropout", "clipping", "amp", "init"}:
+            summary_ws.cell(row=r_idx, column=7, value="Có" if scored else "Chưa")
+        if scored:
+            best = max(scored, key=lambda r: float(r["val_macro_f1"]))
+            summary_ws.cell(
+                row=r_idx, column=8,
+                value=f"Tốt nhất: {best['exp_id']} (val macro-F1={float(best['val_macro_f1']):.4f}); xem REPORT.md.",
+            )
+        else:
+            summary_ws.cell(row=r_idx, column=8, value="Không có lần chạy hợp lệ.")
+    summary_ws["D13"] = sum(
+        1 for group in ("loss", "optimizer", "hparam", "dropout", "clipping", "amp", "init")
+        if any(r.get("group") == group and r.get("val_macro_f1") is not None for r in rows)
+    )
 
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
